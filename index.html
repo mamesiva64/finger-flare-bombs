@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔥 フィンガーフレアボムズシミュレータ</title>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+            background-color: #222;
+            color: white;
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+        }
+
+        #video-container {
+            position: relative;
+            width: 640px; /* 映像サイズに合わせて調整 */
+            height: 480px;
+            margin-bottom: 20px;
+            border: 2px solid #555;
+        }
+
+        video, canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        #status {
+            font-size: 1.2em;
+            margin-top: 10px;
+        }
+
+        #controls {
+            margin-top: 10px;
+            padding: 10px;
+            border: 1px solid #444;
+            border-radius: 5px;
+            background-color: #333;
+        }
+
+        #controls label {
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>🔥 フィンガーフレアボムズシミュレータ</h1>
+    <div id="video-container">
+        <video id="webcam" playsinline style="visibility: hidden;"></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+    <div id="status">手をカメラに向けて、指をまっすぐに伸ばしてください。</div>
+    
+    <div id="controls">
+        <input type="checkbox" id="showLandmarks" checked>
+        <label for="showLandmarks">ランドマークと骨格を表示</label>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+    <script>
+        // ----------------------------------------------------
+        // 1. 要素の取得と初期設定
+        // ----------------------------------------------------
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const statusElement = document.getElementById('status');
+        const showLandmarksCheckbox = document.getElementById('showLandmarks'); // チェックボックス
+
+        // 指ごとのランドマークID (指の根元、第1関節、第2関節、指先)
+        const FINGER_LANDMARKS = {
+            // [付け根, 第1関節, 第2関節, 指先]
+            THUMB: [2, 3, 4], // 親指は3点 (ID 2, 3, 4)
+            INDEX: [5, 6, 7, 8],
+            MIDDLE: [9, 10, 11, 12],
+            RING: [13, 14, 15, 16],
+            PINKY: [17, 18, 19, 20]
+        };
+
+        const FIRE_STATUS = {
+            THUMB: false,
+            INDEX: false,
+            MIDDLE: false,
+            RING: false,
+            PINKY: false
+        };
+
+        // ----------------------------------------------------
+        // 2. 指がまっすぐか判定する関数
+        // ----------------------------------------------------
+
+        /**
+         * 特定の指がまっすぐ伸びているか判定する（角度ベースの簡易判定）
+         */
+        function isFingerStraight(landmarks, fingerIds) {
+            // === 堅牢なチェック ===
+            if (!landmarks || fingerIds.length < 3) {
+                 return false;
+            }
+            if (fingerIds.some(id => !landmarks[id])) {
+                 return false;
+            }
+            // ====================
+
+            const p_base = landmarks[fingerIds[0]];
+            const p_mid = landmarks[fingerIds[1]];
+            const p_tip = landmarks[fingerIds[fingerIds.length - 1]];
+
+            // ベクトル v1 = (p_mid - p_base), v2 = (p_tip - p_mid)
+            const v1_x = p_mid.x - p_base.x;
+            const v1_y = p_mid.y - p_base.y;
+            const v2_x = p_tip.x - p_mid.x;
+            const v2_y = p_tip.y - p_mid.y;
+
+            // 内積とノルム（長さ）から角度を計算
+            const dot_product = v1_x * v2_x + v1_y * v2_y;
+            const magnitude1 = Math.sqrt(v1_x * v1_x + v1_y * v1_y);
+            const magnitude2 = Math.sqrt(v2_x * v2_x + v2_y * v2_y);
+
+            // ゼロ除算の回避
+            if (magnitude1 * magnitude2 === 0) return false;
+            const cos_theta = dot_product / (magnitude1 * magnitude2);
+
+            // しきい値
+            const STRAIGHT_THRESHOLD = 0.90; 
+            
+            // 親指は構造上特殊なため、しきい値を緩める
+            if (fingerIds.length === 3) {
+                return cos_theta > 0.85; 
+            }
+
+            return cos_theta > STRAIGHT_THRESHOLD;
+        }
+
+        // ----------------------------------------------------
+        // 3. 炎のエフェクトを描画する関数
+        // ----------------------------------------------------
+
+        /**
+         * 指先に炎のようなエフェクトを描画する
+         */
+        function drawFireEffect(landmarks, ctx) {
+            // キーと指先ランドマークIDの対応
+            const TIP_MAP = {
+                THUMB: 4,
+                INDEX: 8,
+                MIDDLE: 12,
+                RING: 16,
+                PINKY: 20
+            };
+
+            let activeFires = 0;
+            
+            // FIRE_STATUSオブジェクトを反復処理
+            for (const key in FIRE_STATUS) {
+                if (FIRE_STATUS[key] === true) {
+                    activeFires++;
+                    const tipId = TIP_MAP[key];
+                    const landmark = landmarks[tipId];
+
+                    if (landmark) {
+                        // 座標を正規化座標からピクセル座標に変換
+                        const x = landmark.x * canvasElement.width;
+                        const y = landmark.y * canvasElement.height;
+                        
+                        // 炎の色とぼかしの設定
+                        ctx.shadowColor = 'orange';
+                        ctx.shadowBlur = 15;
+                        
+                        // 炎の揺らぎを表現するため、中心座標をランダムにずらす
+                        const wobbleX = (Math.random() - 0.5) * 5;
+                        const wobbleY = (Math.random() - 0.5) * 5;
+
+                        // 炎の描画 (外側から内側へ)
+                        ctx.beginPath();
+                        ctx.fillStyle = 'rgba(255, 100, 0, 0.8)'; // 赤オレンジ
+                        ctx.arc(x + wobbleX, y + wobbleY, 20, 0, 2 * Math.PI); 
+                        ctx.fill();
+
+                        ctx.beginPath();
+                        ctx.fillStyle = 'rgba(255, 165, 0, 0.9)'; // オレンジ
+                        ctx.arc(x + wobbleX * 0.5, y + wobbleY * 0.5, 12, 0, 2 * Math.PI); 
+                        ctx.fill();
+
+                        ctx.beginPath();
+                        ctx.fillStyle = 'rgba(255, 255, 0, 1.0)'; // 黄色い芯
+                        ctx.arc(x, y, 6, 0, 2 * Math.PI); 
+                        ctx.fill();
+                    }
+                }
+            }
+
+            // 描画後はシャドウをリセット
+            ctx.shadowBlur = 0;
+            ctx.shadowColor = 'transparent';
+
+            if (activeFires == 0) {
+                statusElement.textContent = "✋ 指をまっすぐに伸ばしてパワーを溜めてください。";
+            } else if (activeFires === 1) {
+                statusElement.textContent = `メ`;
+            } else if (activeFires === 2) {
+                statusElement.textContent = `メラ`;
+            } else if (activeFires === 3) {
+                statusElement.textContent = `メラゾー`;
+            } else if (activeFires === 4) {
+                statusElement.textContent = `メラゾーマ`;
+            } else {
+                statusElement.textContent = `🔥 五指爆炎弾（フィンガーフレアボムズ）`;
+            }
+        }
+
+
+        // ----------------------------------------------------
+        // 4. MediaPipe Hands の初期化と処理
+        // ----------------------------------------------------
+        
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1, 
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        // 検出結果が返ってきたときのコールバック
+        hands.onResults((results) => {
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            
+            // 左右反転の適用（映像と描画）
+            canvasCtx.scale(-1, 1);
+            canvasCtx.translate(-canvasElement.width, 0);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            // 炎のステータスをリセット
+            FIRE_STATUS.THUMB = false;
+            FIRE_STATUS.INDEX = false;
+            FIRE_STATUS.MIDDLE = false;
+            FIRE_STATUS.RING = false;
+            FIRE_STATUS.PINKY = false;
+
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const handLandmarks = results.multiHandLandmarks[0];
+
+                // 指の判定
+                FIRE_STATUS.THUMB = isFingerStraight(handLandmarks, FINGER_LANDMARKS.THUMB);
+                FIRE_STATUS.INDEX = isFingerStraight(handLandmarks, FINGER_LANDMARKS.INDEX);
+                FIRE_STATUS.MIDDLE = isFingerStraight(handLandmarks, FINGER_LANDMARKS.MIDDLE);
+                FIRE_STATUS.RING = isFingerStraight(handLandmarks, FINGER_LANDMARKS.RING);
+                FIRE_STATUS.PINKY = isFingerStraight(handLandmarks, FINGER_LANDMARKS.PINKY);
+
+                // 炎のエフェクトを描画
+                drawFireEffect(handLandmarks, canvasCtx);
+
+                // ランドマークの描画（チェックボックスの状態に依存）
+                if (showLandmarksCheckbox.checked) {
+                    drawConnectors(canvasCtx, handLandmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 5});
+                    drawLandmarks(canvasCtx, handLandmarks, {color: '#FF0000', lineWidth: 2});
+                }
+
+            } else {
+                statusElement.textContent = "カメラに手をかざしてください。";
+            }
+
+            canvasCtx.restore(); 
+        });
+
+        // ----------------------------------------------------
+        // 5. カメラの起動
+        // ----------------------------------------------------
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+        camera.start();
+
+        videoElement.addEventListener('loadeddata', () => {
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+        });
+    </script>
+</body>
+</html>
